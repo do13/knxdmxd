@@ -34,6 +34,13 @@ typedef struct {
 } trigger_t;
 
 typedef struct {
+  eibaddr_t ga;
+  unsigned universe;
+  int channel;
+  char statusga_type;
+} statusga_t;
+
+typedef struct {
   unsigned universe;
   int channel;
 } dmxaddr_t;

@@ -68,6 +68,10 @@
 
 #define NOT_FOUND SIZE_MAX
 
+#define STATUS_BIT 1
+#define STATUS_VALUE 2
+#define STATUS_ALL 3
+
 /*#define true 1
 #define false 0
 typedef u_int8_t bool;
@@ -121,7 +125,7 @@ void init_E131() {
 
 u_int16_t universe_list[MAX_UNIVERSES + 1] = { 0 }; // max. 16 universes
 size_t channel_num = 0, dimmer_num = 0, scene_num = 0, cuelist_num,
-    trigger_num = 0, universe_num;
+    trigger_num = 0, universe_num, statusga_num = 0;
 channel_t *channels;
 dimmer_t *dimmers;
 cue_t *scenes;
@@ -130,6 +134,7 @@ universe_t *universes;
 pthread_mutex_t universe_lock[MAX_UNIVERSES], knx_out_queue_lock, scene_lock,
     cuelist_lock, dimmer_lock;
 
+statusga_t *status_gas;
 trigger_t *triggers;
 
 /*
@@ -429,6 +434,30 @@ size_t find_first_trigger(eibaddr_t in, size_t first, size_t last) {
   return NOT_FOUND;
 }
 
+size_t find_status_ga(eibaddr_t in, size_t first, size_t last) {
+  if (in == status_gas[first].ga) {
+    if (!first)
+      return first;
+    while ((--first) >= 0) { // look if same address is before
+      if (status_gas[first].ga != in) {
+        break;
+      }
+    }
+    return (first + 1);
+  }
+  if (last > first + 1) {
+    size_t middle = (last + first) / 2;
+    if (in >= status_gas[middle].ga) {
+      return find_status_ga(in, middle, last);
+    }
+    if (in < status_gas[middle].ga) {
+      return find_status_ga(in, first, middle);
+    }
+  }
+  return NOT_FOUND;
+}
+
+
 void set_dmx_channel(u_int16_t u, u_int16_t c, u_int8_t value, float fade_in,
     float fade_out) {
   struct timeb t;
@@ -481,8 +510,8 @@ void call_cue(cue_t *cue) {
   syslog(LOG_DEBUG, "call_cue: called cue %s", cue->name);
 }
 
-void send_channel_status(u_int16_t u, u_int16_t c) {
-  if (universes[u].statusvalue[c]) {
+void send_channel_status(u_int16_t u, u_int16_t c, u_int8_t type) {
+  if ((type & STATUS_VALUE) && universes[u].statusvalue[c]) {
     syslog(LOG_DEBUG, "send_channel_status: sending status to ga %u",
         universes[u].statusvalue[c]);
     knx_message_t *msg;
@@ -499,7 +528,7 @@ void send_channel_status(u_int16_t u, u_int16_t c) {
     knx_queue_append_message(&knx_out_head, &knx_out_tail, &knx_out_size,
         msg);
   }
-  if (universes[u].statusswitch[c]) {
+  if ((type & STATUS_BIT) && universes[u].statusswitch[c]) {
     syslog(LOG_DEBUG, "send_channel_status: sending on/off to ga %u",
         universes[u].statusswitch[c]);
     knx_message_t *msg;
@@ -642,7 +671,7 @@ void *crossfade_processor() {
             syslog(LOG_DEBUG,
                 "crossfade_processor: finished crossfading %d.%d to %d",
                 universe_list[u], i, universes[u].new[i]);
-            send_channel_status(u, i);
+            send_channel_status(u, i, STATUS_ALL);
           } else {
             float p =
                 (float) (currenttime - universes[u].start[i])
@@ -703,8 +732,28 @@ void *knx_receiver() {
         break;
       } else {
         switch (buf[1] & 0xC0) {
-        case 0x00:
-          break;
+        case 0x00: {
+          size_t statusga =
+               ((dest > status_gas[statusga_num - 1].ga)
+               || (dest < status_gas[0].ga)) ?
+                -1 : find_status_ga(dest, 0, statusga_num);
+          if (statusga != NOT_FOUND) {
+
+            do {
+              syslog(LOG_DEBUG,
+                    "knx_receiver: statusga %u (GA:%u) triggered target %u (type %u)",
+                     statusga, status_gas[statusga].ga,
+                     status_gas[statusga].channel,
+                     status_gas[statusga].statusga_type);
+              send_channel_status(status_gas[statusga].universe,
+                     status_gas[statusga].channel,
+                     status_gas[statusga].statusga_type);
+              if ((++statusga) > statusga_num)
+                break;
+            } while (status_gas[statusga].ga == dest);
+          }
+        }
+        break;
         case 0x40:
           //FIXME: response dunno
           break;
@@ -792,7 +841,7 @@ void *knx_receiver() {
                               dimmers[triggers[trigger].target].dmx.channel));
                       send_channel_status(
                           dimmers[triggers[trigger].target].dmx.universe,
-                          dimmers[triggers[trigger].target].dmx.channel);
+                          dimmers[triggers[trigger].target].dmx.channel, STATUS_ALL);
                     } else {
                       bool direction = (val & 0x08) > 0;
                       u_int8_t step = (val & 0x7);
@@ -990,6 +1039,33 @@ bool json_get_trigger(struct json_object *trigger, const char trigger_type,
   return true;
 }
 
+bool add_statusga (unsigned universe, int channel, eibaddr_t ga, uint8_t type) {
+
+  if (!ga)
+    return false; // Not needed
+
+  if (statusga_num % 20 == 0) {
+    statusga_t *old = status_gas;
+    status_gas = calloc(statusga_num + 20, sizeof(*status_gas));
+    if (status_gas == NULL) {
+      syslog(LOG_ERR,
+          "add_statusga: could not allocate memory for next status ga");
+      exit(EXIT_FAILURE);
+    }
+    memcpy(status_gas, old, statusga_num * sizeof(*status_gas));
+    free(old);
+  }
+
+  status_gas[statusga_num].statusga_type = type;
+  status_gas[statusga_num].ga = ga;
+  status_gas[statusga_num].channel = channel;
+  status_gas[statusga_num].universe = universe;
+
+  statusga_num++;
+
+  return true;
+}
+
 bool json_get_cue(cue_t *cue, struct json_object *json_cue, const int cuenum,
     const int cue_type) {
 
@@ -1122,6 +1198,10 @@ int trigger_compare(const void * a, const void * b) {
   return ((*(trigger_t*) a).ga - (*(trigger_t*) b).ga);
 }
 
+int statusga_compare(const void * a, const void * b) {
+  return ((*(statusga_t*) a).ga - (*(statusga_t*) b).ga);
+}
+
 void load_config() {
 
   struct json_object *config, *in_data;
@@ -1231,6 +1311,9 @@ void load_config() {
         channels[i].dmx.universe = universe_num;
       }
     }
+
+    add_statusga(channels[i].dmx.universe, channels[i].dmx.channel, channels[i].switchga, STATUS_BIT); // Add statusgs
+    add_statusga(channels[i].dmx.universe, channels[i].dmx.channel, channels[i].valuega, STATUS_VALUE); // Add statusgs
 
     syslog(LOG_DEBUG,
         "load_config: named DMX %d/%d as %s, status: %d/%d, factor: %f",
@@ -1613,6 +1696,7 @@ void load_config() {
   }
 
   qsort(triggers, trigger_num, sizeof(*triggers), trigger_compare); // sort triggers
+  qsort(status_gas, statusga_num, sizeof(*status_gas), statusga_compare); // sort statusgas
 
   return;
 }
