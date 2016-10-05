@@ -415,6 +415,8 @@ void *knx_sender() {
 
 size_t find_first_trigger(eibaddr_t in, size_t first, size_t last) {
   if (in == triggers[first].ga) {
+    if (first == 0)
+      return first;
     while ((--first) >= 0) { // look if same address is before
       if (triggers[first].ga != in) {
         break;
